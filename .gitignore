@@ -1,0 +1,25 @@
+# Build output
+build/
+dist/
+installer_output/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Herd data and backups — never in the repository
+*.db
+*.db-journal
+activation.json
+passkey.hash
+backup_*/
+*.replaced-*
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

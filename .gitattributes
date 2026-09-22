@@ -1,0 +1,28 @@
+# Line endings, settled here rather than left to whatever each machine does.
+#
+# It matters more than it looks. cmd.exe parses a parenthesised block in a
+# .bat file by reading ahead, and with bare LF endings that read-ahead goes
+# wrong — "The syntax of the command is incorrect" — so the Windows launcher
+# must arrive with CRLF however it was cloned. The shell launchers must stay
+# LF for the opposite reason: /bin/sh reads a trailing CR as part of the
+# command and fails with "\r: not found".
+
+*.bat            text eol=crlf
+*.cmd            text eol=crlf
+*.iss            text eol=crlf
+
+*.sh             text eol=lf
+*.command        text eol=lf
+*.py             text eol=lf
+*.yml            text eol=lf
+*.toml           text eol=lf
+*.spec           text eol=lf
+*.txt            text eol=lf
+
+# Never touched: an .ico is not text, and line-ending translation would
+# corrupt it.
+*.ico            binary
+*.png            binary
+*.db             binary
+*.xlsx           binary
+*.zip            binary

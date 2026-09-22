@@ -1,0 +1,8 @@
+# Windows-only extras: the desktop window itself.
+# pywebview draws the app in a real window using the Edge WebView2 runtime
+# that ships with Windows 10 and 11; pythonnet is how it talks to it.
+#
+# Bounded, like requirements.txt: a major release of either should stop the
+# build where it can be read, not the program on a farm.
+pywebview>=5.0,<7
+pythonnet>=3.0.3,<4
