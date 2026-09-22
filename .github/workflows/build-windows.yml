@@ -1,0 +1,191 @@
+name: Build Windows installer
+
+# Builds the Cattle & Small Stock System into a Windows .exe and wraps it in
+# an Inno Setup installer. Run it from the Actions tab, or by pushing a tag.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    env:
+      # Windows hands Python whatever code page the machine is set to, and the
+      # older ones cannot represent a dash or an accent. Without this, a step
+      # can fail while printing a message rather than while doing its work.
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install the app's packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-windows.txt
+          # Not pinned on purpose. PyInstaller has to understand the numpy it
+          # is packing: an older PyInstaller with a current numpy collects the
+          # pre-2.0 numpy.core and the installed program dies on
+          # "No module named 'numpy._core._exceptions'".
+          pip install --upgrade "pyinstaller>=6.14"
+          python -c "import PyInstaller, numpy; print('pyinstaller', PyInstaller.__version__, '| numpy', numpy.__version__)"
+
+      - name: Regenerate the app from its generator
+        # cattlemanagementapp.py is written by the generator, not edited by
+        # hand. Rebuilding it here keeps the two from drifting apart.
+        run: python cattlemanagement_generator1.py
+
+      - name: Check the app compiles
+        run: |
+          python -m compileall -q cattlemanagementapp.py run_desktop.py make_key.py
+          python -c "import ast, sys; ast.parse(open('cattlemanagementapp.py', encoding='utf-8').read()); print('app parses')"
+
+      - name: Check the export libraries are importable
+        # A PDF or spreadsheet button that fails at run time is the one thing
+        # a user cannot work around, so prove the libraries are here first.
+        run: |
+          python -c "import reportlab, openpyxl, PIL, pandas, altair, streamlit; print('export libraries present')"
+          python -c "from reportlab.pdfgen import canvas; import io; b=io.BytesIO(); c=canvas.Canvas(b); c.drawString(40,40,'ok'); c.save(); assert b.getvalue()[:5]==b'%PDF-'; print('reportlab writes PDFs')"
+          python run_desktop.py --selfcheck
+
+      - name: Check the icon
+        run: python -c "from PIL import Image; i=Image.open('logo.ico'); print('logo.ico frames:', sorted(i.ico.sizes()))"
+
+      - name: Build the .exe
+        run: pyinstaller --noconfirm --clean build_windows.spec
+
+      - name: Confirm the bundled libraries came along
+        shell: pwsh
+        run: |
+          $app = "dist\CattleSmallStock"
+          foreach ($name in @("streamlit", "reportlab", "openpyxl", "PIL", "pandas", "altair")) {
+            $found = Get-ChildItem -Path "$app\_internal" -Filter $name -Recurse -Directory -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+            if ($null -eq $found) { Write-Error "Missing from the build: $name"; exit 1 }
+            Write-Host "  bundled: $name"
+          }
+          if (-not (Test-Path "$app\_internal\cattlemanagementapp.py")) {
+            Write-Error "The app file is not in the build"; exit 1
+          }
+          Write-Host "  bundled: cattlemanagementapp.py"
+
+      - name: Confirm the .exe exists
+        shell: pwsh
+        run: |
+          $exe = "dist\CattleSmallStock\CattleSmallStock.exe"
+          if (-not (Test-Path $exe)) { Write-Error "No .exe was produced"; exit 1 }
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+          Write-Host "  CattleSmallStock.exe - $size MB"
+
+      - name: Run the built .exe and make it prove itself
+        # The one check that matters. The .exe has no console, so a library
+        # that did not make it into the bundle is invisible until someone
+        # installs it and it dies. This runs the real .exe, imports everything
+        # the app imports, does arithmetic with numpy, writes a PDF, and
+        # compiles the app — and fails the build rather than shipping it.
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $exe = "dist\CattleSmallStock\CattleSmallStock.exe"
+          $report = "selfcheck.txt"
+          $p = Start-Process -FilePath $exe `
+                             -ArgumentList "--selfcheck","--report",$report `
+                             -PassThru -Wait -NoNewWindow
+          if (Test-Path $report) { Get-Content $report | ForEach-Object { Write-Host $_ } }
+          else { Write-Host "  (the .exe wrote no report at all)" }
+          if ($p.ExitCode -ne 0) {
+            Write-Error "The built .exe cannot run. Nothing will be packaged."
+            exit 1
+          }
+          Write-Host "  The built program starts and has everything it needs."
+
+      - name: Start the built .exe as a server and fetch a page
+        # And once more end to end: the real .exe serving the real app over
+        # the loopback address, answering an HTTP request.
+        shell: pwsh
+        timeout-minutes: 6
+        run: |
+          $exe = "dist\CattleSmallStock\CattleSmallStock.exe"
+          $env:CATTLE_SERVER_CHILD = "1"
+          $env:CATTLE_PORT = "8599"
+          $env:CATTLE_DESKTOP = "1"
+          $server = Start-Process -FilePath $exe -PassThru -NoNewWindow
+          $up = $false
+          foreach ($i in 1..90) {
+            Start-Sleep -Seconds 2
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:8599/_stcore/health" `
+                                     -UseBasicParsing -TimeoutSec 5
+              if ($r.StatusCode -eq 200) { $up = $true; break }
+            } catch { }
+            if ($server.HasExited) {
+              Write-Error "The server stopped on its own (exit $($server.ExitCode))."
+              exit 1
+            }
+          }
+          if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
+          if (-not $up) { Write-Error "The built .exe never served a page."; exit 1 }
+          Write-Host "  The built program served a page on 127.0.0.1:8599."
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Find the Inno Setup compiler
+        # Only that it is there, and where. Its version is NOT checked here:
+        # ISCC.exe carries no ProductVersion resource, so asking Windows for
+        # one returns 0.0.0.0 and any check built on it fails a compiler that
+        # is perfectly good. installer.iss reads the real version from the
+        # compiler itself and adapts, so nothing out here needs to know it.
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) {
+            Write-Error "Inno Setup 6 is not installed - 'choco install innosetup' did not put ISCC.exe where it was expected."
+            exit 1
+          }
+          Write-Host "  ISCC.exe at $iscc"
+          # The banner names the version. ISCC exits non-zero when run with no
+          # arguments, which is not a failure, so the code is swallowed.
+          try { & $iscc 2>&1 | Select-Object -First 2 | ForEach-Object { Write-Host "  $_" } } catch { }
+          exit 0
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe" }
+          & $iscc installer.iss
+          if ($LASTEXITCODE -ne 0) { Write-Error "Inno Setup failed"; exit 1 }
+          Get-ChildItem installer_output | ForEach-Object {
+            Write-Host ("  " + $_.Name + " - " + [math]::Round($_.Length / 1MB, 2) + " MB")
+          }
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: CattleSmallStock-Windows-Installer
+          path: installer_output/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the unpacked program
+        uses: actions/upload-artifact@v4
+        with:
+          name: CattleSmallStock-Windows-Folder
+          path: dist/CattleSmallStock/
+          if-no-files-found: error
+          retention-days: 7
